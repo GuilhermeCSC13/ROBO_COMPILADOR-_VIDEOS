@@ -2,7 +2,7 @@ name: Processar Vídeos Supabase
 
 on:
   schedule:
-    - cron: "*/10 * * * *" # Roda a cada 10 minutos automaticamente
+    - cron: "*/5 * * * *" # Roda a cada 10 minutos automaticamente
   workflow_dispatch: # Permite rodar manualmente clicando num botão no GitHub
 
 jobs:
