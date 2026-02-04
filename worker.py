@@ -16,13 +16,14 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 def processar_fila():
     print("🤖 Robô GitHub Worker Iniciado...")
     
-    # 1. Pegar Job Pendente
+    # 1. Pegar Job com a etiqueta EXCLUSIVA 'FILA_GITHUB'
+    # O robô antigo procura por 'PENDENTE', então ele não vai ver estes jobs.
     response = supabase.table("reuniao_processing_queue")\
-        .select("*").eq("status", "PENDENTE").limit(1).execute()
+        .select("*").eq("status", "FILA_GITHUB").limit(1).execute()
     
     jobs = response.data
     if not jobs: 
-        print("zzZ Fila vazia. Nada para fazer.")
+        print("zzZ Fila vazia (Nenhum job 'FILA_GITHUB' encontrado).")
         return
 
     job = jobs[0]
