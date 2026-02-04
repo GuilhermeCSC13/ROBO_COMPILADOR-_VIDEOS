@@ -19,11 +19,11 @@ def processar_fila():
     # 1. Pegar Job com a etiqueta EXCLUSIVA 'FILA_GITHUB'
     # O robô antigo procura por 'PENDENTE', então ele não vai ver estes jobs.
     response = supabase.table("reuniao_processing_queue")\
-        .select("*").eq("status", "FILA_GITHUB").limit(1).execute()
+        .select("*").eq("status", "PROCESSANDO").limit(1).execute()
     
     jobs = response.data
     if not jobs: 
-        print("zzZ Fila vazia (Nenhum job 'FILA_GITHUB' encontrado).")
+        print("zzZ Fila vazia (Nenhum job 'PROCESSANDO' encontrado).")
         return
 
     job = jobs[0]
@@ -33,7 +33,7 @@ def processar_fila():
 
     # Trava o job
     supabase.table("reuniao_processing_queue")\
-        .update({"status": "PROCESSANDO_RENDER", "log_text": "GitHub Actions: Iniciando..."})\
+        .update({"status": "PROCESSANDO_GITH", "log_text": "GitHub Actions: Iniciando..."})\
         .eq("id", job_id).execute()
 
     local_files = []
