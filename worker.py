@@ -67,14 +67,23 @@ def processar_fila():
                 local_files.append(local_path)
                 f_list.write(f"file '{local_path}'\n")
 
-        # C. Compressão FFmpeg
+        # C. Compressão FFmpeg (CORRIGIDA FPS)
         print("🎬 Iniciando Compressão (FFmpeg)...")
-        # Ajuste fino para velocidade vs qualidade
+        # ADICIONADO: -r 30 (Força 30fps para corrigir o bug de 1k fps e acelerar o processo)
         cmd = [
-            "ffmpeg", "-f", "concat", "-safe", "0", "-i", list_file_path,
-            "-c:v", "libx264", "-preset", "faster", "-crf", "28",
-            "-c:a", "aac", "-b:a", "64k",
-            "-movflags", "+faststart", "-y", output_compressed
+            "ffmpeg", 
+            "-f", "concat", 
+            "-safe", "0", 
+            "-i", list_file_path,
+            "-r", "30",              # <--- O SEGREDO DA VELOCIDADE
+            "-c:v", "libx264", 
+            "-preset", "veryfast",   # Acelerado
+            "-crf", "28",            # Compressão forte
+            "-c:a", "aac", 
+            "-b:a", "64k",
+            "-movflags", "+faststart", 
+            "-y", 
+            output_compressed
         ]
         subprocess.run(cmd, check=True)
         
@@ -90,7 +99,7 @@ def processar_fila():
         
         uploader = my_client.uploader(
             file_path=output_compressed,
-            chunk_size=50 * 1024 * 1024, # 50MB chunks (GitHub tem internet rapida)
+            chunk_size=50 * 1024 * 1024,
             metadata={
                 "bucketName": "gravacoes",
                 "objectName": path_destino,
@@ -100,8 +109,10 @@ def processar_fila():
         )
         uploader.upload()
 
-        # E. Finalização
-        print("💾 Atualizando Banco de Dados...")
+        # E. Finalização e Limpeza da Nuvem
+        print("💾 Atualizando Banco e Limpando Lixo...")
+        
+        # 1. Atualiza Reunião
         supabase.table("reunioes").update({
             "gravacao_path": path_destino,
             "gravacao_status": "CONCLUIDO",
@@ -109,15 +120,22 @@ def processar_fila():
             "gravacao_size_bytes": os.path.getsize(output_compressed)
         }).eq("id", reuniao_id).execute()
 
+        # 2. Marca Job como Concluído
         supabase.table("reuniao_processing_queue").update({
             "status": "CONCLUIDO", 
-            "log_text": f"Sucesso via GitHub Actions. Tamanho: {tamanho_mb:.1f}MB"
+            "log_text": f"Sucesso GitHub. Tamanho final: {tamanho_mb:.1f}MB"
         }).eq("id", job_id).execute()
 
-        # Limpeza na Nuvem (Opcional, descomente se quiser limpar as partes)
-        # caminhos_para_apagar = [f"{caminho_base}/{p['name']}" for p in partes]
-        # if caminhos_para_apagar:
-        #     supabase.storage.from_("gravacoes").remove(caminhos_para_apagar)
+        # 3. DELETA AS PARTES ORIGINAIS (Economia de Espaço)
+        print("🗑️ Apagando partes originais para liberar espaço...")
+        caminhos_para_apagar = [f"{caminho_base}/{p['name']}" for p in partes]
+        if caminhos_para_apagar:
+            # Apaga em lotes de 100 para não dar erro de URL muito longa
+            batch_size = 100
+            for i in range(0, len(caminhos_para_apagar), batch_size):
+                batch = caminhos_para_apagar[i:i + batch_size]
+                supabase.storage.from_("gravacoes").remove(batch)
+                print(f"   - Lote {i} removido.")
 
     except Exception as e:
         print(f"❌ ERRO FATAL: {e}")
@@ -125,7 +143,7 @@ def processar_fila():
             "status": "ERRO", 
             "log_text": str(e)
         }).eq("id", job_id).execute()
-        exit(1) # Faz o Action falhar visualmente
+        exit(1)
 
 if __name__ == "__main__":
     processar_fila()
