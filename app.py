@@ -1,342 +1,288 @@
 import os
 import subprocess
-from flask import Flask, jsonify
 from supabase import create_client
-from tusclient import client
-
-app = Flask(__name__)
+from tusclient import client as tus_client
 
 # --- CONFIGURAÇÃO ---
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    print("⚠️  ERRO: Variáveis de ambiente faltando.")
+    raise Exception("⚠️ Variáveis de ambiente SUPABASE_URL e SUPABASE_KEY são obrigatórias.")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Buckets (ajuste se algum nome for diferente no seu projeto)
-BUCKET_GRAVACOES = "gravacoes"
+BUCKET = "gravacoes"
 
-# Nomes padrão de arquivos gerados
-VIDEO_FINAL_NAME = "video_completo_render.mp4"
-AUDIO_FINAL_NAME = "audio_reuniao.m4a"  # leve e excelente pra voz (AAC)
-
-
-def tus_upload(bucket: str, object_path: str, local_file: str, content_type: str):
+def tus_upload(local_path: str, object_name: str, content_type: str):
     tus_url = f"{SUPABASE_URL}/storage/v1/upload/resumable"
-    my_client = client.TusClient(
-        url=tus_url,
-        headers={"Authorization": f"Bearer {SUPABASE_KEY}", "x-upsert": "true"},
-    )
+    headers = {"Authorization": f"Bearer {SUPABASE_KEY}", "x-upsert": "true"}
+    my_client = tus_client.TusClient(url=tus_url, headers=headers)
 
     uploader = my_client.uploader(
-        file_path=local_file,
+        file_path=local_path,
         chunk_size=6 * 1024 * 1024,
         metadata={
-            "bucketName": bucket,
-            "objectName": object_path,
+            "bucketName": BUCKET,
+            "objectName": object_name,
             "contentType": content_type,
             "cacheControl": "3600",
         },
     )
     uploader.upload()
 
+def safe_rm(p):
+    try:
+        if p and os.path.exists(p):
+            os.remove(p)
+    except Exception:
+        pass
 
-def storage_list(bucket: str, path: str):
-    return supabase.storage.from_(bucket).list(path) or []
+def list_storage(path: str):
+    return supabase.storage.from_(BUCKET).list(path) or []
 
+def download_storage(path: str) -> bytes:
+    return supabase.storage.from_(BUCKET).download(path)
 
-def storage_download(bucket: str, object_path: str) -> bytes:
-    return supabase.storage.from_(bucket).download(object_path)
+def remove_storage(paths: list):
+    if paths:
+        supabase.storage.from_(BUCKET).remove(paths)
 
+def find_sessao_folder(reuniao_id: str):
+    raiz = list_storage(f"reunioes/{reuniao_id}")
+    return next((i["name"] for i in raiz if i.get("name", "").startswith("sess_")), None)
 
-def storage_remove(bucket: str, objects: list[str]):
-    if not objects:
-        return
-    supabase.storage.from_(bucket).remove(objects)
+def storage_file_exists(object_path: str) -> bool:
+    # checa no diretório pelo nome do arquivo
+    if not object_path or "/" not in object_path:
+        return False
+    dir_path, fname = object_path.rsplit("/", 1)
+    try:
+        items = list_storage(dir_path)
+        return any(i.get("name") == fname for i in items)
+    except Exception:
+        return False
 
-
-def find_session_folder(reuniao_id: str) -> str | None:
-    raiz = storage_list(BUCKET_GRAVACOES, f"reunioes/{reuniao_id}")
-    sess = next((i["name"] for i in raiz if i.get("name", "").startswith("sess_")), None)
-    return sess
-
-
-def pick_existing_video_path(caminho_base: str) -> str | None:
-    # procura mp4 final (padrão) ou qualquer mp4 que você já tenha gerado no passado
-    arquivos = storage_list(BUCKET_GRAVACOES, caminho_base)
-    # 1) preferencial: o padrão
-    if any(a.get("name") == VIDEO_FINAL_NAME for a in arquivos):
-        return f"{caminho_base}/{VIDEO_FINAL_NAME}"
-    # 2) fallback: qualquer mp4 existente
-    mp4s = [a.get("name") for a in arquivos if str(a.get("name", "")).lower().endswith(".mp4")]
-    if mp4s:
-        mp4s.sort()
-        return f"{caminho_base}/{mp4s[-1]}"
-    return None
-
-
-def audio_exists(caminho_base: str) -> bool:
-    arquivos = storage_list(BUCKET_GRAVACOES, caminho_base)
-    return any(a.get("name") == AUDIO_FINAL_NAME for a in arquivos)
-
-
-def parts_exist(caminho_base: str) -> list[dict]:
-    arquivos = storage_list(BUCKET_GRAVACOES, caminho_base)
-    partes = [p for p in arquivos if p.get("name", "").startswith("part_") and p.get("name", "").endswith(".webm")]
-    partes.sort(key=lambda x: x["name"])
-    return partes
-
-
-def ffmpeg_concat_and_compress(list_file_path: str, output_mp4: str):
-    ffmpeg_cmd = [
-        "ffmpeg",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", list_file_path,
-        "-c:v", "libx264",
-        "-crf", "28",
-        "-preset", "veryfast",
-        "-c:a", "aac",
-        "-b:a", "64k",
+def ffmpeg_concat_mp4(list_file_path: str, output_mp4: str):
+    cmd_video = [
+        "ffmpeg", "-f", "concat", "-safe", "0", "-i", list_file_path,
+        "-r", "30",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "28",
+        "-c:a", "aac", "-b:a", "64k",
         "-movflags", "+faststart",
-        "-y",
-        output_mp4
+        "-y", output_mp4
     ]
-    subprocess.run(ffmpeg_cmd, check=True)
+    subprocess.run(cmd_video, check=True)
 
-
-def ffmpeg_extract_audio(input_video: str, output_audio: str):
-    # m4a (AAC) otimizado para voz
-    ffmpeg_cmd = [
-        "ffmpeg",
-        "-i", input_video,
+def ffmpeg_extract_audio_m4a(input_video: str, output_audio: str):
+    # leve e ótimo pra voz (AAC em M4A)
+    cmd_audio = [
+        "ffmpeg", "-i", input_video,
         "-vn",
-        "-c:a", "aac",
-        "-b:a", "64k",
-        "-movflags", "+faststart",
-        "-y",
-        output_audio
+        "-c:a", "aac", "-b:a", "64k", "-ar", "44100",
+        "-y", output_audio
     ]
-    subprocess.run(ffmpeg_cmd, check=True)
+    subprocess.run(cmd_audio, check=True)
 
+def processar_fila():
+    print("🤖 Robô GitHub Worker Iniciado (Vídeo + Áudio)...")
 
-def get_size_mb(path: str) -> float:
-    return os.path.getsize(path) / (1024 * 1024)
-
-
-@app.route("/")
-def home():
-    return "🤖 Robô Pro (Compilador + Áudio) Ativo."
-
-
-@app.route("/processar")
-def processar():
-    # 1) Pegar Job Pendente
-    response = supabase.table("reuniao_processing_queue") \
-        .select("*") \
-        .eq("status", "PENDENTE") \
-        .limit(1) \
+    # 1) Pegar 1 job pendente (ajuste conforme seu status real)
+    response = (
+        supabase.table("reuniao_processing_queue")
+        .select("*")
+        .eq("status", "PROCESSANDO")  # <-- mantenho como você está usando
+        .limit(1)
         .execute()
+    )
 
     jobs = response.data
     if not jobs:
-        return jsonify({"status": "Fila vazia"})
+        print("zzZ Fila vazia.")
+        return
 
     job = jobs[0]
     reuniao_id = job["reuniao_id"]
     job_id = job["id"]
+    print(f"🚀 Processando Reunião: {reuniao_id}")
 
-    print(f"🚀 Iniciando Job: {reuniao_id}")
-
-    # Marca como processando
-    supabase.table("reuniao_processing_queue") \
-        .update({"status": "PROCESSANDO_RENDER", "log_text": "Verificando parts/vídeo/áudio..."}) \
-        .eq("id", job_id).execute()
+    # trava o job
+    supabase.table("reuniao_processing_queue").update({
+        "status": "PROCESSANDO_GITH",
+        "log_text": "GitHub Actions: Verificando mídia (parts/mp4/áudio)..."
+    }).eq("id", job_id).execute()
 
     local_files = []
-    list_file_path = f"/tmp/{reuniao_id}_list.txt"
-    local_video_mp4 = f"/tmp/{reuniao_id}_video.mp4"
-    local_audio_m4a = f"/tmp/{reuniao_id}_audio.m4a"
+    list_file_path = f"list_{reuniao_id}.txt"
+    output_video = f"output_{reuniao_id}.mp4"
+    output_audio = f"audio_{reuniao_id}.m4a"
 
     try:
-        # 2) Ler reunião no banco (pra saber se já tem áudio gravado em coluna)
-        reuniao = supabase.table("reunioes").select("*").eq("id", reuniao_id).single().execute().data or {}
+        # 2) Pega registro da reunião para saber paths existentes
+        reuniao_resp = supabase.table("reunioes").select("*").eq("id", reuniao_id).single().execute()
+        reuniao = reuniao_resp.data or {}
 
-        # 3) Descobrir pasta sess_
-        sessao_folder = find_session_folder(reuniao_id)
-        if not sessao_folder:
-            raise Exception("Pasta sessão não encontrada (sess_...).")
+        gravacao_path = reuniao.get("gravacao_path")  # vídeo (mp4)
+        gravacao_bucket = reuniao.get("gravacao_bucket") or BUCKET
 
-        caminho_base = f"reunioes/{reuniao_id}/{sessao_folder}"
+        gravacao_audio_path = reuniao.get("gravacao_audio_path")  # áudio (m4a)
+        gravacao_audio_bucket = reuniao.get("gravacao_audio_bucket") or gravacao_bucket
 
-        # 4) Checar existência
-        partes = parts_exist(caminho_base)
+        # 3) Descobre sessão e parts
+        print("📂 Listando arquivos no Supabase...")
+        sessao_folder = find_sessao_folder(reuniao_id)
 
-        # vídeo existente no storage
-        storage_video_path = reuniao.get("gravacao_path") or pick_existing_video_path(caminho_base)
-        # áudio existe no storage OU já está apontado na tabela
-        has_audio_in_db = bool(reuniao.get("gravacao_audio_path"))
-        has_audio_in_bucket = audio_exists(caminho_base)
-        has_audio = has_audio_in_db or has_audio_in_bucket
+        caminho_base = None
+        partes = []
 
-        # 5) CASO A: tem parts -> compila vídeo + extrai áudio + apaga parts
-        if partes:
-            supabase.table("reuniao_processing_queue") \
-                .update({"log_text": f"Encontradas {len(partes)} parts. Compilando MP4 + extraindo áudio..."}) \
-                .eq("id", job_id).execute()
+        if sessao_folder:
+            caminho_base = f"reunioes/{reuniao_id}/{sessao_folder}"
+            arquivos = list_storage(caminho_base)
+            partes = [p for p in arquivos if p.get("name", "").startswith("part_") and p.get("name", "").endswith(".webm")]
+            partes.sort(key=lambda x: x["name"])
 
-            # Download parts e gerar list.txt do concat
+        has_parts = len(partes) > 0
+
+        # 4) Detecta vídeo e áudio existentes (conforme paths do banco)
+        video_exists = storage_file_exists(gravacao_path) if gravacao_path else False
+        audio_exists = storage_file_exists(gravacao_audio_path) if gravacao_audio_path else False
+
+        # =========================
+        # CASO 1: TEM PARTS -> compila vídeo + extrai áudio + apaga parts
+        # =========================
+        if has_parts:
+            print(f"⬇️ Baixando {len(partes)} partes...")
             with open(list_file_path, "w") as f_list:
                 for p in partes:
                     name = p["name"]
-                    local_part = f"/tmp/{name}"
-                    data = storage_download(BUCKET_GRAVACOES, f"{caminho_base}/{name}")
-                    with open(local_part, "wb") as fp:
-                        fp.write(data)
-                    local_files.append(local_part)
-                    f_list.write(f"file '{local_part}'\n")
+                    local_path = name  # ok no GitHub runner
+                    full_path = f"{caminho_base}/{name}"
+                    print(f"   - Baixando {name}...")
 
-            # Compilar mp4
-            ffmpeg_concat_and_compress(list_file_path, local_video_mp4)
-            video_mb = get_size_mb(local_video_mp4)
-            print(f"✅ Vídeo final: {video_mb:.2f} MB")
+                    with open(local_path, "wb") as f_video:
+                        data = download_storage(full_path)
+                        f_video.write(data)
 
-            # Extrair áudio
-            ffmpeg_extract_audio(local_video_mp4, local_audio_m4a)
-            audio_mb = get_size_mb(local_audio_m4a)
-            print(f"✅ Áudio final: {audio_mb:.2f} MB")
+                    local_files.append(local_path)
+                    f_list.write(f"file '{local_path}'\n")
 
-            # Upload vídeo + áudio
-            video_dest = f"{caminho_base}/{VIDEO_FINAL_NAME}"
-            audio_dest = f"{caminho_base}/{AUDIO_FINAL_NAME}"
+            print("🎬 Gerando Vídeo MP4 (30fps)...")
+            ffmpeg_concat_mp4(list_file_path, output_video)
 
-            tus_upload(BUCKET_GRAVACOES, video_dest, local_video_mp4, "video/mp4")
-            tus_upload(BUCKET_GRAVACOES, audio_dest, local_audio_m4a, "audio/mp4")  # m4a
+            print("🎵 Extraindo Áudio (M4A) para a IA...")
+            ffmpeg_extract_audio_m4a(output_video, output_audio)
 
-            # Apagar parts (depois do upload ok)
-            caminhos_para_apagar = [f"{caminho_base}/{p['name']}" for p in partes]
-            for i in range(0, len(caminhos_para_apagar), 20):
-                storage_remove(BUCKET_GRAVACOES, caminhos_para_apagar[i:i+20])
+            # uploads
+            path_video = f"{caminho_base}/video_completo_render.mp4"
+            path_audio = f"{caminho_base}/audio_completo.m4a"
 
-            # Atualiza reunião (vídeo + áudio)
+            print("⬆️ Uploading Vídeo...")
+            tus_upload(output_video, path_video, "video/mp4")
+
+            print("⬆️ Uploading Áudio...")
+            tus_upload(output_audio, path_audio, "audio/mp4")
+
+            # atualiza banco
             supabase.table("reunioes").update({
-                "gravacao_bucket": BUCKET_GRAVACOES,
-                "gravacao_path": video_dest,
+                "gravacao_bucket": BUCKET,
+                "gravacao_path": path_video,
                 "gravacao_status": "CONCLUIDO",
                 "gravacao_mime": "video/mp4",
-                "gravacao_size_bytes": os.path.getsize(local_video_mp4),
+                "gravacao_size_bytes": os.path.getsize(output_video),
 
-                "gravacao_audio_bucket": BUCKET_GRAVACOES,
-                "gravacao_audio_path": audio_dest,
+                "gravacao_audio_bucket": BUCKET,
+                "gravacao_audio_path": path_audio,
                 "gravacao_audio_mime": "audio/mp4",
-                "gravacao_audio_size_bytes": os.path.getsize(local_audio_m4a),
+                "gravacao_audio_size_bytes": os.path.getsize(output_audio),
             }).eq("id", reuniao_id).execute()
+
+            # apaga parts no storage
+            print("🧹 Apagando parts do storage...")
+            caminhos_apagar = [f"{caminho_base}/{p['name']}" for p in partes]
+            for i in range(0, len(caminhos_apagar), 20):
+                remove_storage(caminhos_apagar[i:i+20])
 
             supabase.table("reuniao_processing_queue").update({
                 "status": "CONCLUIDO",
-                "log_text": f"Sucesso. Vídeo {video_mb:.1f}MB / Áudio {audio_mb:.1f}MB. Parts apagadas."
+                "log_text": "Sucesso: Vídeo e Áudio gerados (parts removidas)."
             }).eq("id", job_id).execute()
 
-            # limpeza local
-            if os.path.exists(list_file_path): os.remove(list_file_path)
-            if os.path.exists(local_video_mp4): os.remove(local_video_mp4)
-            if os.path.exists(local_audio_m4a): os.remove(local_audio_m4a)
-            for f in local_files:
-                if os.path.exists(f): os.remove(f)
+            print("✅ Concluído (parts->mp4+audio).")
+            return
 
-            return jsonify({
-                "status": "Sucesso",
-                "id": reuniao_id,
-                "acao": "COMPILOU_VIDEO_E_AUDIO_E_APAGOU_PARTS",
-                "video_mb": video_mb,
-                "audio_mb": audio_mb,
-            })
+        # =========================
+        # CASO 2: NÃO TEM PARTS
+        # - se tem vídeo e não tem áudio -> extrai só áudio
+        # - se tem vídeo e tem áudio -> noop
+        # - se não tem vídeo -> erro
+        # =========================
 
-        # 6) CASO B: não tem parts. Se tem vídeo mp4 e não tem áudio -> extrai só áudio
-        if storage_video_path and not has_audio:
-            supabase.table("reuniao_processing_queue") \
-                .update({"log_text": "Sem parts. Vídeo existe e áudio ausente. Extraindo áudio..."}) \
-                .eq("id", job_id).execute()
+        if video_exists and audio_exists:
+            print("✅ Já existe vídeo e áudio. Nada a fazer.")
+            supabase.table("reuniao_processing_queue").update({
+                "status": "CONCLUIDO",
+                "log_text": "Sem ação: vídeo e áudio já existentes."
+            }).eq("id", job_id).execute()
+            return
 
-            # baixar mp4
-            video_bytes = storage_download(BUCKET_GRAVACOES, storage_video_path)
-            with open(local_video_mp4, "wb") as f:
-                f.write(video_bytes)
+        if video_exists and (not audio_exists):
+            print("🎧 Vídeo existe e áudio não existe. Extraindo apenas o áudio...")
 
-            # extrair áudio
-            ffmpeg_extract_audio(local_video_mp4, local_audio_m4a)
-            audio_mb = get_size_mb(local_audio_m4a)
+            # baixa o vídeo existente
+            local_mp4 = f"orig_{reuniao_id}.mp4"
+            with open(local_mp4, "wb") as f:
+                f.write(download_storage(gravacao_path))
+            local_files.append(local_mp4)
 
-            audio_dest = f"{caminho_base}/{AUDIO_FINAL_NAME}"
-            tus_upload(BUCKET_GRAVACOES, audio_dest, local_audio_m4a, "audio/mp4")  # m4a
+            ffmpeg_extract_audio_m4a(local_mp4, output_audio)
 
-            # atualizar reunião (somente áudio; mantém vídeo como está)
+            # define destino do áudio
+            if caminho_base:
+                path_audio = f"{caminho_base}/audio_completo.m4a"
+            else:
+                # mesmo diretório do vídeo
+                dir_path = gravacao_path.rsplit("/", 1)[0]
+                path_audio = f"{dir_path}/audio_completo.m4a"
+
+            print("⬆️ Uploading Áudio...")
+            tus_upload(output_audio, path_audio, "audio/mp4")
+
+            # atualiza banco
             supabase.table("reunioes").update({
-                "gravacao_audio_bucket": BUCKET_GRAVACOES,
-                "gravacao_audio_path": audio_dest,
+                "gravacao_audio_bucket": BUCKET,
+                "gravacao_audio_path": path_audio,
                 "gravacao_audio_mime": "audio/mp4",
-                "gravacao_audio_size_bytes": os.path.getsize(local_audio_m4a),
+                "gravacao_audio_size_bytes": os.path.getsize(output_audio),
             }).eq("id", reuniao_id).execute()
 
             supabase.table("reuniao_processing_queue").update({
                 "status": "CONCLUIDO",
-                "log_text": f"Áudio extraído do MP4. Áudio {audio_mb:.1f}MB."
+                "log_text": "Sucesso: Áudio extraído do MP4 existente."
             }).eq("id", job_id).execute()
 
-            # limpar local
-            if os.path.exists(local_video_mp4): os.remove(local_video_mp4)
-            if os.path.exists(local_audio_m4a): os.remove(local_audio_m4a)
+            print("✅ Concluído (mp4->audio).")
+            return
 
-            return jsonify({
-                "status": "Sucesso",
-                "id": reuniao_id,
-                "acao": "EXTRAIU_AUDIO_APENAS",
-                "audio_mb": audio_mb,
-                "video_path": storage_video_path,
-            })
-
-        # 7) CASO C: já tem vídeo + áudio -> não faz nada
-        if storage_video_path and has_audio:
-            supabase.table("reuniao_processing_queue").update({
-                "status": "CONCLUIDO",
-                "log_text": "Já existe vídeo e áudio. Nenhuma ação necessária."
-            }).eq("id", job_id).execute()
-
-            return jsonify({
-                "status": "OK",
-                "id": reuniao_id,
-                "acao": "NADA_A_FAZER",
-                "video_path": storage_video_path,
-                "audio_in_db": bool(reuniao.get("gravacao_audio_path")),
-                "audio_in_bucket": has_audio_in_bucket,
-            })
-
-        # 8) Sem parts, sem vídeo -> erro
-        raise Exception("Sem parts e sem vídeo mp4 encontrado para esta reunião.")
+        # não tem parts e também não tem mp4 (ou path inválido)
+        msg = "Nenhuma part .webm encontrada e também não foi encontrado vídeo MP4 para extrair áudio."
+        print(f"❌ ERRO: {msg}")
+        supabase.table("reuniao_processing_queue").update({
+            "status": "ERRO",
+            "log_text": msg
+        }).eq("id", job_id).execute()
+        raise Exception(msg)
 
     except Exception as e:
-        msg = str(e)
-        print(f"❌ Erro: {msg}")
-        supabase.table("reuniao_processing_queue").update({"status": "ERRO", "log_text": msg}).eq("id", job_id).execute()
-
-        # tentar limpar lixo local
-        for p in [list_file_path, local_video_mp4, local_audio_m4a]:
-            if os.path.exists(p):
-                try:
-                    os.remove(p)
-                except:
-                    pass
-        for f in local_files:
-            if os.path.exists(f):
-                try:
-                    os.remove(f)
-                except:
-                    pass
-
-        return jsonify({"status": "Erro", "msg": msg}), 500
-
+        print(f"❌ ERRO: {e}")
+        supabase.table("reuniao_processing_queue").update({
+            "status": "ERRO",
+            "log_text": str(e)
+        }).eq("id", job_id).execute()
+        raise
+    finally:
+        # limpeza local
+        for f in local_files + [list_file_path, output_video, output_audio]:
+            safe_rm(f)
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    processar_fila()
