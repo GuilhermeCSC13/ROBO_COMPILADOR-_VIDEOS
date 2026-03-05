@@ -105,7 +105,6 @@ def find_sessao_folder(reuniao_id: str):
     return next((i["name"] for i in raiz if i.get("name", "").startswith("sess_")), None)
 
 def storage_file_exists(object_path: str) -> bool:
-    # checa no diretório pelo nome do arquivo
     if not object_path or "/" not in object_path:
         return False
     dir_path, fname = object_path.rsplit("/", 1)
@@ -116,21 +115,17 @@ def storage_file_exists(object_path: str) -> bool:
         return False
 
 # =============================================================================
-# FFMPEG (ÁUDIO-FIRST + VÍDEO SIMPLES)
-# - Objetivo: NÃO perder áudio
-# - Vídeo: baixa qualidade (rápido)
+# FFMPEG (ÁUDIO BLINDADO + VÍDEO COMPLETO)
 # =============================================================================
 def run_ffmpeg(cmd: list, title: str, job_id: str = None):
     log(title, job_id, icon="🎬", db=True)
-    # Mostra comando (para debug)
     log("CMD: " + " ".join(cmd), job_id, icon="🧾", db=False)
     subprocess.run(cmd, check=True)
     log(f"OK: {title}", job_id, icon="✅", db=True)
 
 def ffmpeg_concat_audio_from_parts(list_parts_path: str, out_wav: str, job_id: str = None):
     """
-    Concatena e normaliza ÁUDIO direto das parts (webm), gerando WAV contínuo.
-    WAV é o meio mais confiável para neutralizar timestamps/opus quebrados.
+    Gera WAV contínuo do áudio das parts (não perde áudio).
     """
     cmd = [
         "ffmpeg",
@@ -159,18 +154,22 @@ def ffmpeg_wav_to_m4a(in_wav: str, out_m4a: str, job_id: str = None):
     ]
     run_ffmpeg(cmd, f"WAV -> M4A (AAC) -> {out_m4a}", job_id)
 
-def ffmpeg_make_mp4_with_external_audio(first_part_webm: str, in_wav_audio: str, out_mp4: str, job_id: str = None):
+def ffmpeg_make_mp4_from_parts_with_external_audio(list_parts_path: str, in_wav_audio: str, out_mp4: str, job_id: str = None):
     """
     MP4 final com:
-      - VÍDEO: da primeira part (baixa qualidade e fps reduzido)
-      - ÁUDIO: do WAV contínuo (garantido)
+      - VÍDEO: concat de TODAS as parts (0:v)
+      - ÁUDIO: WAV contínuo (1:a)
     """
     cmd = [
         "ffmpeg",
         "-hide_banner", "-loglevel", "error",
         "-fflags", "+genpts",
-        "-i", first_part_webm,
+
+        "-f", "concat", "-safe", "0",
+        "-i", list_parts_path,
+
         "-i", in_wav_audio,
+
         "-map", "0:v:0",
         "-map", "1:a:0",
 
@@ -184,17 +183,15 @@ def ffmpeg_make_mp4_with_external_audio(first_part_webm: str, in_wav_audio: str,
         "-b:a", "96k",
         "-ar", "48000",
 
-        # garante que o vídeo não corte o áudio (audio manda)
         "-shortest",
         "-movflags", "+faststart",
         "-y", out_mp4
     ]
-    run_ffmpeg(cmd, f"MP4 final (vídeo leve + áudio contínuo) -> {out_mp4}", job_id)
+    run_ffmpeg(cmd, f"MP4 final (vídeo concat parts + áudio contínuo) -> {out_mp4}", job_id)
 
 def ffmpeg_extract_audio_m4a(input_video: str, output_audio: str, job_id: str = None):
     """
-    Mantido (não perde nada): extrai áudio do MP4 final.
-    Obs: com áudio-first, o M4A já vem do WAV; mas mantemos essa função caso você use no CASO 2.
+    Mantido: extrai áudio do MP4 existente (CASO 2).
     """
     cmd = [
         "ffmpeg",
@@ -245,10 +242,14 @@ def processar_fila():
     log("Job travado.", job_id, icon="✅", db=True)
 
     local_files = []
-    list_file_path = f"list_{reuniao_id}.txt"            # (mantido)
-    list_norm_path = f"list_norm_{reuniao_id}.txt"       # (mantido)
+    list_file_path = f"list_{reuniao_id}.txt"            # mantido (compat)
+    list_norm_path = f"list_norm_{reuniao_id}.txt"       # mantido (compat)
     output_video = f"output_{reuniao_id}.mp4"
     output_audio = f"audio_{reuniao_id}.m4a"
+
+    # arquivos do novo fluxo
+    list_parts_path = f"list_parts_{reuniao_id}.txt"
+    wav_audio = f"audio_{reuniao_id}.wav"
 
     try:
         # 2) Registro da reunião
@@ -294,16 +295,13 @@ def processar_fila():
         log(f"video_exists={video_exists} | audio_exists={audio_exists}", job_id, icon="ℹ️", db=True)
 
         # =========================
-        # CASO 1: TEM PARTS (ÁUDIO-FIRST)
+        # CASO 1: TEM PARTS -> ÁUDIO BLINDADO + VÍDEO COMPLETO
         # =========================
         if has_parts:
-            log("Modo PARTS: ÁUDIO-FIRST (não perde áudio).", job_id, icon="✅", db=True)
+            log("Modo PARTS: gerar áudio contínuo (WAV) e MP4 completo (vídeo concat + áudio WAV).", job_id, icon="✅", db=True)
 
-            list_parts_path = f"list_parts_{reuniao_id}.txt"
-            wav_audio = f"audio_{reuniao_id}.wav"
-
-            # baixa parts e cria list
-            log(f"Baixando {len(partes)} parts...", job_id, icon="⬇️", db=True)
+            # baixar parts e criar lista
+            log(f"Baixando {len(partes)} parts e gerando {list_parts_path}...", job_id, icon="⬇️", db=True)
             tdl = timed("Download das parts", job_id, db=True)
 
             with open(list_parts_path, "w") as f_list:
@@ -322,22 +320,21 @@ def processar_fila():
             tdl("OK")
             local_files.append(list_parts_path)
 
-            # 1) WAV contínuo
+            # 1) áudio WAV contínuo
             tw = timed("Gerar WAV contínuo", job_id, db=True)
             ffmpeg_concat_audio_from_parts(list_parts_path, wav_audio, job_id)
             tw(f"{os.path.getsize(wav_audio)} bytes")
             local_files.append(wav_audio)
 
-            # 2) M4A final
+            # 2) M4A final (para IA)
             tm4a = timed("Gerar M4A final", job_id, db=True)
             ffmpeg_wav_to_m4a(wav_audio, output_audio, job_id)
             tm4a(f"{os.path.getsize(output_audio)} bytes")
             local_files.append(output_audio)
 
-            # 3) MP4 final (vídeo leve + áudio contínuo)
-            first_local_webm = partes[0]["name"]  # já baixada
-            tmp4 = timed("Gerar MP4 final (vídeo leve + áudio contínuo)", job_id, db=True)
-            ffmpeg_make_mp4_with_external_audio(first_local_webm, wav_audio, output_video, job_id)
+            # 3) MP4 final (vídeo concat das parts + áudio contínuo)
+            tmp4 = timed("Gerar MP4 final", job_id, db=True)
+            ffmpeg_make_mp4_from_parts_with_external_audio(list_parts_path, wav_audio, output_video, job_id)
             tmp4(f"{os.path.getsize(output_video)} bytes")
             local_files.append(output_video)
 
@@ -364,7 +361,7 @@ def processar_fila():
             }).eq("id", reuniao_id).execute()
             log("Reunião atualizada.", job_id, icon="✅", db=True)
 
-            # apaga parts no storage
+            # apagar parts no storage
             log("Apagando parts do storage...", job_id, icon="🧹", db=True)
             caminhos_apagar = [f"{caminho_base}/{p['name']}" for p in partes]
             for i in range(0, len(caminhos_apagar), 20):
@@ -373,10 +370,10 @@ def processar_fila():
 
             supabase.table("reuniao_processing_queue").update({
                 "status": "CONCLUIDO",
-                "log_text": "Sucesso: Áudio gerado a partir das parts (WAV->M4A) e MP4 criado com áudio contínuo."
+                "log_text": "Sucesso: MP4 completo (vídeo concat) + áudio contínuo (WAV->M4A)."
             }).eq("id", job_id).execute()
 
-            log("✅ Concluído (ÁUDIO-FIRST).", job_id, icon="🎉", db=True)
+            log("Concluído (vídeo completo + áudio completo).", job_id, icon="🎉", db=True)
             return
 
         # =========================
@@ -425,7 +422,7 @@ def processar_fila():
                 "log_text": "Sucesso: Áudio extraído do MP4 existente."
             }).eq("id", job_id).execute()
 
-            log("✅ Concluído (mp4->audio).", job_id, icon="🎉", db=True)
+            log("Concluído (mp4->audio).", job_id, icon="🎉", db=True)
             return
 
         msg = "Nenhuma part .webm encontrada e também não foi encontrado vídeo MP4 para extrair áudio."
@@ -444,9 +441,11 @@ def processar_fila():
         }).eq("id", job_id).execute()
         raise
     finally:
-        # limpeza local
         log("Limpando arquivos locais temporários...", job_id, icon="🧹", db=False)
-        for f in local_files + [list_file_path, list_norm_path, output_video, output_audio]:
+        for f in local_files + [
+            list_file_path, list_norm_path, list_parts_path, wav_audio,
+            output_video, output_audio
+        ]:
             safe_rm(f)
         log("Limpeza concluída.", job_id, icon="✅", db=False)
 
