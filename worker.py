@@ -128,19 +128,18 @@ def storage_file_exists(object_path: str) -> bool:
 
 
 # =============================================================================
-# FFMPEG (ÁUDIO BLINDADO + VÍDEO COMPLETO)
+# FFMPEG
 # =============================================================================
 def run_ffmpeg(cmd: list, title: str, job_id: str = None):
     log(title, job_id, icon="🎬", db=True)
+    # Mostra comando pra debug
     log("CMD: " + " ".join(cmd), job_id, icon="🧾", db=False)
     subprocess.run(cmd, check=True)
     log(f"OK: {title}", job_id, icon="✅", db=True)
 
 
+# ---- ÁUDIO BLINDADO (WAV por part -> concat WAV) ----
 def ffmpeg_extract_audio_part_to_wav(input_webm: str, out_wav: str, job_id: str = None):
-    """
-    Extrai áudio de UMA part para WAV, zerando PTS e estabilizando (resolve quebra no início da part 2).
-    """
     cmd = [
         "ffmpeg",
         "-hide_banner", "-loglevel", "error",
@@ -157,9 +156,6 @@ def ffmpeg_extract_audio_part_to_wav(input_webm: str, out_wav: str, job_id: str 
 
 
 def ffmpeg_concat_wavs_copy(list_wav_path: str, out_wav: str, job_id: str = None):
-    """
-    Concatena WAVs (PCM) por copy. Muito estável.
-    """
     cmd = [
         "ffmpeg",
         "-hide_banner", "-loglevel", "error",
@@ -185,31 +181,59 @@ def ffmpeg_wav_to_m4a(in_wav: str, out_m4a: str, job_id: str = None):
     run_ffmpeg(cmd, f"WAV -> M4A (AAC) -> {out_m4a}", job_id)
 
 
-def ffmpeg_make_mp4_from_parts_with_external_audio(list_parts_path: str, in_wav_audio: str, out_mp4: str, job_id: str = None):
+# ---- VÍDEO COMPLETO (remux webm->mkv por part -> concat mkv copy) ----
+def ffmpeg_remux_video_webm_to_mkv(input_webm: str, out_mkv: str, job_id: str = None):
     """
-    MP4 final com:
-      - VÍDEO: concat de TODAS as parts (0:v)
-      - ÁUDIO: WAV contínuo (1:a) - blindado
+    Remuxa o container (SEM reencode) para MKV, estabiliza concat do vídeo.
     """
     cmd = [
         "ffmpeg",
         "-hide_banner", "-loglevel", "error",
         "-fflags", "+genpts",
+        "-i", input_webm,
+        "-map", "0:v:0",   # só vídeo
+        "-c", "copy",
+        "-y", out_mkv
+    ]
+    run_ffmpeg(cmd, f"Remux vídeo WEBM->MKV (copy) -> {out_mkv}", job_id)
 
+
+def ffmpeg_concat_mkvs_copy(list_mkv_path: str, out_mkv: str, job_id: str = None):
+    cmd = [
+        "ffmpeg",
+        "-hide_banner", "-loglevel", "error",
         "-f", "concat", "-safe", "0",
-        "-i", list_parts_path,
+        "-i", list_mkv_path,
+        "-c", "copy",
+        "-y", out_mkv
+    ]
+    run_ffmpeg(cmd, f"Concat MKVs (copy) -> {out_mkv}", job_id)
 
+
+def ffmpeg_make_mp4_from_video_mkv_and_external_audio(video_mkv: str, in_wav_audio: str, out_mp4: str, job_id: str = None):
+    """
+    MP4 final:
+      - VÍDEO: vem do MKV concatenado (completo)
+      - ÁUDIO: vem do WAV contínuo (blindado)
+    """
+    cmd = [
+        "ffmpeg",
+        "-hide_banner", "-loglevel", "error",
+        "-fflags", "+genpts",
+        "-i", video_mkv,
         "-i", in_wav_audio,
 
         "-map", "0:v:0",
         "-map", "1:a:0",
 
+        # vídeo simples (rápido)
         "-c:v", "libx264",
         "-preset", "ultrafast",
         "-crf", "34",
         "-pix_fmt", "yuv420p",
         "-r", "15",
 
+        # áudio
         "-c:a", "aac",
         "-b:a", "96k",
         "-ar", "48000",
@@ -218,13 +242,11 @@ def ffmpeg_make_mp4_from_parts_with_external_audio(list_parts_path: str, in_wav_
         "-movflags", "+faststart",
         "-y", out_mp4
     ]
-    run_ffmpeg(cmd, f"MP4 final (vídeo concat parts + áudio WAV) -> {out_mp4}", job_id)
+    run_ffmpeg(cmd, f"MP4 final (vídeo completo + áudio WAV) -> {out_mp4}", job_id)
 
 
+# ---- CASO 2: extrair áudio do mp4 existente (mantido) ----
 def ffmpeg_extract_audio_m4a(input_video: str, output_audio: str, job_id: str = None):
-    """
-    Mantido: extrai áudio do MP4 existente (CASO 2).
-    """
     cmd = [
         "ffmpeg",
         "-hide_banner",
@@ -265,7 +287,6 @@ def processar_fila():
     job_id = job["id"]
     log(f"Job encontrado: {job_id} | reunião: {reuniao_id}", job_id, icon="✅", db=True)
 
-    # trava o job
     log("Travando job (PROCESSANDO -> PROCESSANDO_GITH)...", job_id, icon="➡️", db=True)
     supabase.table("reuniao_processing_queue").update({
         "status": "PROCESSANDO_GITH",
@@ -274,17 +295,18 @@ def processar_fila():
     log("Job travado.", job_id, icon="✅", db=True)
 
     local_files = []
-    list_file_path = f"list_{reuniao_id}.txt"            # mantido (compat)
-    list_norm_path = f"list_norm_{reuniao_id}.txt"       # mantido (compat)
     output_video = f"output_{reuniao_id}.mp4"
     output_audio = f"audio_{reuniao_id}.m4a"
 
+    # arquivos do fluxo
     list_parts_path = f"list_parts_{reuniao_id}.txt"
     list_wav_parts_path = f"list_wav_parts_{reuniao_id}.txt"
+    list_mkv_parts_path = f"list_mkv_parts_{reuniao_id}.txt"
+
     wav_audio = f"audio_{reuniao_id}.wav"
+    concat_video_mkv = f"video_concat_{reuniao_id}.mkv"
 
     try:
-        # 2) Registro da reunião
         log("Carregando registro da reunião (reunioes)...", job_id, icon="➡️", db=True)
         reuniao_resp = supabase.table("reunioes").select("*").eq("id", reuniao_id).single().execute()
         reuniao = reuniao_resp.data or {}
@@ -298,7 +320,6 @@ def processar_fila():
 
         log(f"gravacao_path={gravacao_path} | gravacao_audio_path={gravacao_audio_path}", job_id, icon="ℹ️", db=True)
 
-        # 3) Descobre sessão e parts
         log("Procurando pasta de sessão (sess_*)...", job_id, icon="➡️", db=True)
         sessao_folder = find_sessao_folder(reuniao_id)
 
@@ -312,7 +333,10 @@ def processar_fila():
             log(f"Listando arquivos em: {caminho_base}", job_id, icon="➡️", db=True)
             arquivos = list_storage(caminho_base)
 
-            partes = [p for p in arquivos if p.get("name", "").startswith("part_") and p.get("name", "").endswith(".webm")]
+            partes = [
+                p for p in arquivos
+                if p.get("name", "").startswith("part_") and p.get("name", "").endswith(".webm")
+            ]
             partes.sort(key=lambda x: x["name"])
             log(f"Parts encontradas: {len(partes)}", job_id, icon="ℹ️", db=True)
         else:
@@ -320,20 +344,19 @@ def processar_fila():
 
         has_parts = len(partes) > 0
 
-        # 4) Detecta vídeo e áudio existentes
         log("Verificando se já existe vídeo/áudio final no Storage...", job_id, icon="➡️", db=True)
         video_exists = storage_file_exists(gravacao_path) if gravacao_path else False
         audio_exists = storage_file_exists(gravacao_audio_path) if gravacao_audio_path else False
         log(f"video_exists={video_exists} | audio_exists={audio_exists}", job_id, icon="ℹ️", db=True)
 
         # =========================
-        # CASO 1: TEM PARTS -> ÁUDIO BLINDADO (wav por part) + VÍDEO COMPLETO
+        # CASO 1: TEM PARTS
         # =========================
         if has_parts:
-            log("Modo PARTS: WAV por part -> concat WAV -> M4A + MP4 completo.", job_id, icon="✅", db=True)
+            log("Modo PARTS: áudio blindado + vídeo completo (MKV concat).", job_id, icon="✅", db=True)
 
-            # baixar parts e criar lista de parts (para o vídeo)
-            log(f"Baixando {len(partes)} parts e gerando {list_parts_path}...", job_id, icon="⬇️", db=True)
+            # 1) Baixar parts e criar list_parts
+            log(f"Baixando {len(partes)} parts...", job_id, icon="⬇️", db=True)
             tdl = timed("Download das parts", job_id, db=True)
 
             with open(list_parts_path, "w") as f_list:
@@ -352,14 +375,14 @@ def processar_fila():
             tdl("OK")
             local_files.append(list_parts_path)
 
-            # 1) WAV por part + lista WAV
-            log("Gerando WAV por part (áudio blindado)...", job_id, icon="➡️", db=True)
+            # 2) ÁUDIO: WAV por part + concat WAV
+            log("Áudio: gerando WAV por part...", job_id, icon="➡️", db=True)
             with open(list_wav_parts_path, "w") as f_list:
                 for idx, p in enumerate(partes, start=1):
-                    local_webm = p["name"]  # já baixado
-                    part_wav = f"part_{idx:05d}.wav"
+                    local_webm = p["name"]
+                    part_wav = f"apart_{idx:05d}.wav"
 
-                    tW = timed(f"[{idx}/{len(partes)}] WAV da part {local_webm}", job_id, db=True)
+                    tW = timed(f"[{idx}/{len(partes)}] WAV {local_webm}", job_id, db=True)
                     ffmpeg_extract_audio_part_to_wav(local_webm, part_wav, job_id)
                     tW(f"{os.path.getsize(part_wav)} bytes")
 
@@ -368,21 +391,40 @@ def processar_fila():
 
             local_files.append(list_wav_parts_path)
 
-            # 2) Concat WAVs -> WAV final
             tCW = timed("Concat WAVs", job_id, db=True)
             ffmpeg_concat_wavs_copy(list_wav_parts_path, wav_audio, job_id)
             tCW(f"{os.path.getsize(wav_audio)} bytes")
             local_files.append(wav_audio)
 
-            # 3) WAV -> M4A
             tm4a = timed("Gerar M4A final", job_id, db=True)
             ffmpeg_wav_to_m4a(wav_audio, output_audio, job_id)
             tm4a(f"{os.path.getsize(output_audio)} bytes")
             local_files.append(output_audio)
 
-            # 4) MP4 final (vídeo concat parts + áudio WAV)
+            # 3) VÍDEO: remux vídeo por part -> MKV + concat MKV copy
+            log("Vídeo: remux WEBM->MKV por part (copy) e concat MKV...", job_id, icon="➡️", db=True)
+            with open(list_mkv_parts_path, "w") as f_list:
+                for idx, p in enumerate(partes, start=1):
+                    local_webm = p["name"]
+                    part_mkv = f"vpart_{idx:05d}.mkv"
+
+                    tV = timed(f"[{idx}/{len(partes)}] Remux vídeo {local_webm}", job_id, db=True)
+                    ffmpeg_remux_video_webm_to_mkv(local_webm, part_mkv, job_id)
+                    tV(f"{os.path.getsize(part_mkv)} bytes")
+
+                    local_files.append(part_mkv)
+                    f_list.write(f"file '{part_mkv}'\n")
+
+            local_files.append(list_mkv_parts_path)
+
+            tCV = timed("Concat MKVs (vídeo)", job_id, db=True)
+            ffmpeg_concat_mkvs_copy(list_mkv_parts_path, concat_video_mkv, job_id)
+            tCV(f"{os.path.getsize(concat_video_mkv)} bytes")
+            local_files.append(concat_video_mkv)
+
+            # 4) MP4 final: vídeo completo + áudio WAV
             tmp4 = timed("Gerar MP4 final", job_id, db=True)
-            ffmpeg_make_mp4_from_parts_with_external_audio(list_parts_path, wav_audio, output_video, job_id)
+            ffmpeg_make_mp4_from_video_mkv_and_external_audio(concat_video_mkv, wav_audio, output_video, job_id)
             tmp4(f"{os.path.getsize(output_video)} bytes")
             local_files.append(output_video)
 
@@ -413,12 +455,12 @@ def processar_fila():
             log("Apagando parts do storage...", job_id, icon="🧹", db=True)
             caminhos_apagar = [f"{caminho_base}/{p['name']}" for p in partes]
             for i in range(0, len(caminhos_apagar), 20):
-                remove_storage(caminhos_apagar[i:i+20])
+                remove_storage(caminhos_apagar[i:i + 20])
             log("Parts removidas.", job_id, icon="✅", db=True)
 
             supabase.table("reuniao_processing_queue").update({
                 "status": "CONCLUIDO",
-                "log_text": "Sucesso: MP4 completo (vídeo concat) + áudio blindado (WAV por part -> concat -> M4A)."
+                "log_text": "Sucesso: MP4 completo (MKV concat vídeo) + áudio blindado (WAV por part -> concat -> M4A)."
             }).eq("id", job_id).execute()
 
             log("Concluído (vídeo completo + áudio completo).", job_id, icon="🎉", db=True)
@@ -491,8 +533,8 @@ def processar_fila():
     finally:
         log("Limpando arquivos locais temporários...", job_id, icon="🧹", db=False)
         for f in local_files + [
-            list_file_path, list_norm_path, list_parts_path, list_wav_parts_path, wav_audio,
-            output_video, output_audio
+            list_parts_path, list_wav_parts_path, list_mkv_parts_path,
+            wav_audio, concat_video_mkv, output_video, output_audio
         ]:
             safe_rm(f)
         log("Limpeza concluída.", job_id, icon="✅", db=False)
