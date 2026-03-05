@@ -21,6 +21,7 @@ BUCKET = "gravacoes"
 LOG_TO_DB = os.getenv("LOG_TO_DB", "1").lower() not in ("0", "false", "no")
 LOG_MAX_CHARS = 8000
 
+
 def _db_append_log(job_id: str, line: str):
     if not (LOG_TO_DB and job_id):
         return
@@ -40,21 +41,26 @@ def _db_append_log(job_id: str, line: str):
     except Exception:
         pass
 
+
 def log(msg: str, job_id: str = None, icon: str = "ℹ️", db: bool = False):
     line = f"{icon} {msg}"
     print(line, flush=True)
     if db:
         _db_append_log(job_id, line)
 
+
 def timed(label: str, job_id: str = None, db: bool = False):
     t0 = time.perf_counter()
+
     def end(extra: str = ""):
         dt = time.perf_counter() - t0
         s = f"{label} levou {dt:.1f}s"
         if extra:
             s += f" | {extra}"
         log(s, job_id, icon="⏱️", db=db)
+
     return end
+
 
 # =============================================================================
 # UPLOAD (TUS / RESUMABLE)
@@ -80,6 +86,7 @@ def tus_upload(local_path: str, object_name: str, content_type: str, job_id: str
 
     log(f"Upload concluído -> {object_name}", job_id, icon="✅", db=True)
 
+
 # =============================================================================
 # HELPERS
 # =============================================================================
@@ -90,19 +97,24 @@ def safe_rm(p):
     except Exception:
         pass
 
+
 def list_storage(path: str):
     return supabase.storage.from_(BUCKET).list(path) or []
 
+
 def download_storage(path: str) -> bytes:
     return supabase.storage.from_(BUCKET).download(path)
+
 
 def remove_storage(paths: list):
     if paths:
         supabase.storage.from_(BUCKET).remove(paths)
 
+
 def find_sessao_folder(reuniao_id: str):
     raiz = list_storage(f"reunioes/{reuniao_id}")
     return next((i["name"] for i in raiz if i.get("name", "").startswith("sess_")), None)
+
 
 def storage_file_exists(object_path: str) -> bool:
     if not object_path or "/" not in object_path:
@@ -114,6 +126,7 @@ def storage_file_exists(object_path: str) -> bool:
     except Exception:
         return False
 
+
 # =============================================================================
 # FFMPEG (ÁUDIO BLINDADO + VÍDEO COMPLETO)
 # =============================================================================
@@ -123,23 +136,40 @@ def run_ffmpeg(cmd: list, title: str, job_id: str = None):
     subprocess.run(cmd, check=True)
     log(f"OK: {title}", job_id, icon="✅", db=True)
 
-def ffmpeg_concat_audio_from_parts(list_parts_path: str, out_wav: str, job_id: str = None):
+
+def ffmpeg_extract_audio_part_to_wav(input_webm: str, out_wav: str, job_id: str = None):
     """
-    Gera WAV contínuo do áudio das parts (não perde áudio).
+    Extrai áudio de UMA part para WAV, zerando PTS e estabilizando (resolve quebra no início da part 2).
+    """
+    cmd = [
+        "ffmpeg",
+        "-hide_banner", "-loglevel", "error",
+        "-fflags", "+genpts",
+        "-i", input_webm,
+        "-vn",
+        "-ac", "2",
+        "-ar", "48000",
+        "-af", "asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0",
+        "-c:a", "pcm_s16le",
+        "-y", out_wav
+    ]
+    run_ffmpeg(cmd, f"Extrair áudio da part -> WAV: {out_wav}", job_id)
+
+
+def ffmpeg_concat_wavs_copy(list_wav_path: str, out_wav: str, job_id: str = None):
+    """
+    Concatena WAVs (PCM) por copy. Muito estável.
     """
     cmd = [
         "ffmpeg",
         "-hide_banner", "-loglevel", "error",
         "-f", "concat", "-safe", "0",
-        "-i", list_parts_path,
-        "-vn",
-        "-ac", "2",
-        "-ar", "48000",
-        "-af", "aresample=async=1:first_pts=0",
-        "-c:a", "pcm_s16le",
+        "-i", list_wav_path,
+        "-c", "copy",
         "-y", out_wav
     ]
-    run_ffmpeg(cmd, f"Gerar WAV contínuo do áudio (parts) -> {out_wav}", job_id)
+    run_ffmpeg(cmd, f"Concat WAVs (copy) -> {out_wav}", job_id)
+
 
 def ffmpeg_wav_to_m4a(in_wav: str, out_m4a: str, job_id: str = None):
     cmd = [
@@ -154,11 +184,12 @@ def ffmpeg_wav_to_m4a(in_wav: str, out_m4a: str, job_id: str = None):
     ]
     run_ffmpeg(cmd, f"WAV -> M4A (AAC) -> {out_m4a}", job_id)
 
+
 def ffmpeg_make_mp4_from_parts_with_external_audio(list_parts_path: str, in_wav_audio: str, out_mp4: str, job_id: str = None):
     """
     MP4 final com:
       - VÍDEO: concat de TODAS as parts (0:v)
-      - ÁUDIO: WAV contínuo (1:a)
+      - ÁUDIO: WAV contínuo (1:a) - blindado
     """
     cmd = [
         "ffmpeg",
@@ -187,7 +218,8 @@ def ffmpeg_make_mp4_from_parts_with_external_audio(list_parts_path: str, in_wav_
         "-movflags", "+faststart",
         "-y", out_mp4
     ]
-    run_ffmpeg(cmd, f"MP4 final (vídeo concat parts + áudio contínuo) -> {out_mp4}", job_id)
+    run_ffmpeg(cmd, f"MP4 final (vídeo concat parts + áudio WAV) -> {out_mp4}", job_id)
+
 
 def ffmpeg_extract_audio_m4a(input_video: str, output_audio: str, job_id: str = None):
     """
@@ -207,13 +239,13 @@ def ffmpeg_extract_audio_m4a(input_video: str, output_audio: str, job_id: str = 
     ]
     run_ffmpeg(cmd, f"Extrair Áudio (M4A) -> {output_audio}", job_id)
 
+
 # =============================================================================
 # WORKER
 # =============================================================================
 def processar_fila():
     log("Robô GitHub Worker Iniciado (Vídeo + Áudio)...", icon="🤖")
 
-    # 1) Pegar 1 job pendente
     log("Buscando 1 job com status=PROCESSANDO...", icon="➡️")
     response = (
         supabase.table("reuniao_processing_queue")
@@ -247,8 +279,8 @@ def processar_fila():
     output_video = f"output_{reuniao_id}.mp4"
     output_audio = f"audio_{reuniao_id}.m4a"
 
-    # arquivos do novo fluxo
     list_parts_path = f"list_parts_{reuniao_id}.txt"
+    list_wav_parts_path = f"list_wav_parts_{reuniao_id}.txt"
     wav_audio = f"audio_{reuniao_id}.wav"
 
     try:
@@ -295,12 +327,12 @@ def processar_fila():
         log(f"video_exists={video_exists} | audio_exists={audio_exists}", job_id, icon="ℹ️", db=True)
 
         # =========================
-        # CASO 1: TEM PARTS -> ÁUDIO BLINDADO + VÍDEO COMPLETO
+        # CASO 1: TEM PARTS -> ÁUDIO BLINDADO (wav por part) + VÍDEO COMPLETO
         # =========================
         if has_parts:
-            log("Modo PARTS: gerar áudio contínuo (WAV) e MP4 completo (vídeo concat + áudio WAV).", job_id, icon="✅", db=True)
+            log("Modo PARTS: WAV por part -> concat WAV -> M4A + MP4 completo.", job_id, icon="✅", db=True)
 
-            # baixar parts e criar lista
+            # baixar parts e criar lista de parts (para o vídeo)
             log(f"Baixando {len(partes)} parts e gerando {list_parts_path}...", job_id, icon="⬇️", db=True)
             tdl = timed("Download das parts", job_id, db=True)
 
@@ -320,19 +352,35 @@ def processar_fila():
             tdl("OK")
             local_files.append(list_parts_path)
 
-            # 1) áudio WAV contínuo
-            tw = timed("Gerar WAV contínuo", job_id, db=True)
-            ffmpeg_concat_audio_from_parts(list_parts_path, wav_audio, job_id)
-            tw(f"{os.path.getsize(wav_audio)} bytes")
+            # 1) WAV por part + lista WAV
+            log("Gerando WAV por part (áudio blindado)...", job_id, icon="➡️", db=True)
+            with open(list_wav_parts_path, "w") as f_list:
+                for idx, p in enumerate(partes, start=1):
+                    local_webm = p["name"]  # já baixado
+                    part_wav = f"part_{idx:05d}.wav"
+
+                    tW = timed(f"[{idx}/{len(partes)}] WAV da part {local_webm}", job_id, db=True)
+                    ffmpeg_extract_audio_part_to_wav(local_webm, part_wav, job_id)
+                    tW(f"{os.path.getsize(part_wav)} bytes")
+
+                    local_files.append(part_wav)
+                    f_list.write(f"file '{part_wav}'\n")
+
+            local_files.append(list_wav_parts_path)
+
+            # 2) Concat WAVs -> WAV final
+            tCW = timed("Concat WAVs", job_id, db=True)
+            ffmpeg_concat_wavs_copy(list_wav_parts_path, wav_audio, job_id)
+            tCW(f"{os.path.getsize(wav_audio)} bytes")
             local_files.append(wav_audio)
 
-            # 2) M4A final (para IA)
+            # 3) WAV -> M4A
             tm4a = timed("Gerar M4A final", job_id, db=True)
             ffmpeg_wav_to_m4a(wav_audio, output_audio, job_id)
             tm4a(f"{os.path.getsize(output_audio)} bytes")
             local_files.append(output_audio)
 
-            # 3) MP4 final (vídeo concat das parts + áudio contínuo)
+            # 4) MP4 final (vídeo concat parts + áudio WAV)
             tmp4 = timed("Gerar MP4 final", job_id, db=True)
             ffmpeg_make_mp4_from_parts_with_external_audio(list_parts_path, wav_audio, output_video, job_id)
             tmp4(f"{os.path.getsize(output_video)} bytes")
@@ -370,7 +418,7 @@ def processar_fila():
 
             supabase.table("reuniao_processing_queue").update({
                 "status": "CONCLUIDO",
-                "log_text": "Sucesso: MP4 completo (vídeo concat) + áudio contínuo (WAV->M4A)."
+                "log_text": "Sucesso: MP4 completo (vídeo concat) + áudio blindado (WAV por part -> concat -> M4A)."
             }).eq("id", job_id).execute()
 
             log("Concluído (vídeo completo + áudio completo).", job_id, icon="🎉", db=True)
@@ -443,11 +491,12 @@ def processar_fila():
     finally:
         log("Limpando arquivos locais temporários...", job_id, icon="🧹", db=False)
         for f in local_files + [
-            list_file_path, list_norm_path, list_parts_path, wav_audio,
+            list_file_path, list_norm_path, list_parts_path, list_wav_parts_path, wav_audio,
             output_video, output_audio
         ]:
             safe_rm(f)
         log("Limpeza concluída.", job_id, icon="✅", db=False)
+
 
 if __name__ == "__main__":
     processar_fila()
