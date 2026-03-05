@@ -14,6 +14,9 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 BUCKET = "gravacoes"
 
+# =============================================================================
+# UPLOAD (TUS / RESUMABLE)
+# =============================================================================
 def tus_upload(local_path: str, object_name: str, content_type: str):
     tus_url = f"{SUPABASE_URL}/storage/v1/upload/resumable"
     headers = {"Authorization": f"Bearer {SUPABASE_KEY}", "x-upsert": "true"}
@@ -31,6 +34,9 @@ def tus_upload(local_path: str, object_name: str, content_type: str):
     )
     uploader.upload()
 
+# =============================================================================
+# HELPERS
+# =============================================================================
 def safe_rm(p):
     try:
         if p and os.path.exists(p):
@@ -63,27 +69,80 @@ def storage_file_exists(object_path: str) -> bool:
     except Exception:
         return False
 
-def ffmpeg_concat_mp4(list_file_path: str, output_mp4: str):
-    cmd_video = [
-        "ffmpeg", "-f", "concat", "-safe", "0", "-i", list_file_path,
-        "-r", "30",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "28",
-        "-c:a", "aac", "-b:a", "64k",
+# =============================================================================
+# FFMPEG (BLINDADO PARA MEDIARECORDER WEBM CHUNKED)
+# =============================================================================
+def ffmpeg_normalize_part_to_mp4(input_webm: str, output_mp4: str):
+    """
+    Normaliza cada chunk WebM para um MP4 estável (timestamps e áudio contínuo).
+    - Corrige PTS/DTS (genpts)
+    - Força áudio contínuo (aresample async + first_pts=0)
+    - Força vídeo CFR (vsync cfr)
+    """
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-fflags", "+genpts",
+        "-i", input_webm,
+
+        # Vídeo
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "28",
+        "-pix_fmt", "yuv420p",
+        "-vsync", "cfr",
+
+        # Áudio
+        "-c:a", "aac",
+        "-b:a", "96k",
+        "-ar", "48000",
+        "-ac", "2",
+        "-af", "aresample=async=1:first_pts=0",
+
         "-movflags", "+faststart",
         "-y", output_mp4
     ]
-    subprocess.run(cmd_video, check=True)
+    subprocess.run(cmd, check=True)
+
+def ffmpeg_concat_mp4_copy(list_file_path: str, output_mp4: str):
+    """
+    Concatena MP4 normalizados sem reencode (mais seguro).
+    """
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", list_file_path,
+        "-c", "copy",
+        "-movflags", "+faststart",
+        "-y", output_mp4
+    ]
+    subprocess.run(cmd, check=True)
 
 def ffmpeg_extract_audio_m4a(input_video: str, output_audio: str):
-    # leve e ótimo pra voz (AAC em M4A)
-    cmd_audio = [
-        "ffmpeg", "-i", input_video,
+    """
+    Extrai áudio do MP4 final, garantindo timeline contínua.
+    """
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-i", input_video,
         "-vn",
-        "-c:a", "aac", "-b:a", "64k", "-ar", "44100",
+        "-c:a", "aac",
+        "-b:a", "64k",
+        "-ar", "44100",
+        "-af", "aresample=async=1:first_pts=0",
         "-y", output_audio
     ]
-    subprocess.run(cmd_audio, check=True)
+    subprocess.run(cmd, check=True)
 
+# =============================================================================
+# WORKER
+# =============================================================================
 def processar_fila():
     print("🤖 Robô GitHub Worker Iniciado (Vídeo + Áudio)...")
 
@@ -91,7 +150,7 @@ def processar_fila():
     response = (
         supabase.table("reuniao_processing_queue")
         .select("*")
-        .eq("status", "PROCESSANDO")  # <-- mantenho como você está usando
+        .eq("status", "PROCESSANDO")  # <-- mantém como você está usando
         .limit(1)
         .execute()
     )
@@ -113,7 +172,8 @@ def processar_fila():
     }).eq("id", job_id).execute()
 
     local_files = []
-    list_file_path = f"list_{reuniao_id}.txt"
+    list_file_path = f"list_{reuniao_id}.txt"            # (pode ficar; não é mais usado no fluxo de parts)
+    list_norm_path = f"list_norm_{reuniao_id}.txt"       # ✅ novo
     output_video = f"output_{reuniao_id}.mp4"
     output_audio = f"audio_{reuniao_id}.m4a"
 
@@ -148,26 +208,43 @@ def processar_fila():
         audio_exists = storage_file_exists(gravacao_audio_path) if gravacao_audio_path else False
 
         # =========================
-        # CASO 1: TEM PARTS -> compila vídeo + extrai áudio + apaga parts
+        # CASO 1: TEM PARTS -> NORMALIZA CADA PART -> CONCAT COPY -> EXTRAI ÁUDIO -> APAGA PARTS
         # =========================
         if has_parts:
             print(f"⬇️ Baixando {len(partes)} partes...")
-            with open(list_file_path, "w") as f_list:
-                for p in partes:
-                    name = p["name"]
-                    local_path = name  # ok no GitHub runner
-                    full_path = f"{caminho_base}/{name}"
-                    print(f"   - Baixando {name}...")
 
-                    with open(local_path, "wb") as f_video:
-                        data = download_storage(full_path)
-                        f_video.write(data)
+            normalized_files = []
 
-                    local_files.append(local_path)
-                    f_list.write(f"file '{local_path}'\n")
+            for idx, p in enumerate(partes, start=1):
+                name = p["name"]
+                local_webm = name  # ok no GitHub runner
+                full_path = f"{caminho_base}/{name}"
 
-            print("🎬 Gerando Vídeo MP4 (30fps)...")
-            ffmpeg_concat_mp4(list_file_path, output_video)
+                print(f"   - Baixando {name}...")
+                with open(local_webm, "wb") as f_video:
+                    data = download_storage(full_path)
+                    f_video.write(data)
+
+                local_files.append(local_webm)
+
+                # ✅ normaliza cada part para MP4 estável (tira o “relógio torto” do WebM)
+                local_norm = f"norm_{idx:05d}.mp4"
+                print(f"   - Normalizando {name} -> {local_norm} ...")
+                ffmpeg_normalize_part_to_mp4(local_webm, local_norm)
+
+                local_files.append(local_norm)
+                normalized_files.append(local_norm)
+
+            if len(normalized_files) < 1:
+                raise Exception("Nenhuma part normalizada gerada. Verifique download/ffmpeg.")
+
+            # lista para concat dos MP4 normalizados
+            with open(list_norm_path, "w") as f_list:
+                for nf in normalized_files:
+                    f_list.write(f"file '{nf}'\n")
+
+            print("🎬 Concatenando MP4 normalizados (copy, sem reencode)...")
+            ffmpeg_concat_mp4_copy(list_norm_path, output_video)
 
             print("🎵 Extraindo Áudio (M4A) para a IA...")
             ffmpeg_extract_audio_m4a(output_video, output_audio)
@@ -204,10 +281,10 @@ def processar_fila():
 
             supabase.table("reuniao_processing_queue").update({
                 "status": "CONCLUIDO",
-                "log_text": "Sucesso: Vídeo e Áudio gerados (parts removidas)."
+                "log_text": "Sucesso: Vídeo e Áudio gerados (parts normalizadas + concat copy; parts removidas)."
             }).eq("id", job_id).execute()
 
-            print("✅ Concluído (parts->mp4+audio).")
+            print("✅ Concluído (parts->norm mp4->concat mp4->audio).")
             return
 
         # =========================
@@ -281,7 +358,7 @@ def processar_fila():
         raise
     finally:
         # limpeza local
-        for f in local_files + [list_file_path, output_video, output_audio]:
+        for f in local_files + [list_file_path, list_norm_path, output_video, output_audio]:
             safe_rm(f)
 
 if __name__ == "__main__":
