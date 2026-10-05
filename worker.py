@@ -15,6 +15,10 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 BUCKET = "gravacoes"
 
+# Limite de upload do Storage (acima disso o TUS responde 413). O maior MP4 que
+# já subiu tinha ~501 MB; mira abaixo disso com folga.
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(450 * 1024 * 1024)))
+
 # =============================================================================
 # LOG PASSO A PASSO (console + opcional no banco)
 # =============================================================================
@@ -257,6 +261,73 @@ def ffmpeg_make_mp4_from_video_mkv_and_external_audio(video_mkv: str, in_wav_aud
     run_ffmpeg(cmd, f"MP4 final (vídeo completo + áudio WAV) -> {out_mp4}", job_id)
 
 
+def ffprobe_duracao_segundos(path: str) -> float:
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", path],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    return float(out)
+
+
+def garantir_tamanho_upload(mp4_path: str, job_id: str = None) -> str:
+    """
+    Se o MP4 passar do limite de upload, recodifica com bitrate calculado pela
+    duração (720p máx.) para caber. Devolve o caminho do arquivo a enviar.
+    """
+    tamanho = os.path.getsize(mp4_path)
+    if tamanho <= MAX_UPLOAD_BYTES:
+        return mp4_path
+
+    duracao = ffprobe_duracao_segundos(mp4_path)
+    log(
+        f"MP4 com {tamanho / 1e6:.0f} MB passa do limite de {MAX_UPLOAD_BYTES / 1e6:.0f} MB "
+        f"({duracao / 60:.0f} min). Comprimindo...",
+        job_id, icon="🗜️", db=True,
+    )
+
+    audio_kbps = 96
+    fator = 0.90  # folga para overhead do container
+    atual = mp4_path
+    for tentativa in (1, 2):
+        alvo_kbps = int(MAX_UPLOAD_BYTES * 8 * fator / duracao / 1000) - audio_kbps
+        alvo_kbps = max(alvo_kbps, 150)
+        saida = mp4_path.replace(".mp4", f"_comp{tentativa}.mp4")
+        cmd = [
+            "ffmpeg",
+            "-hide_banner", "-loglevel", "error",
+            "-i", mp4_path,
+            "-map", "0:v:0", "-map", "0:a:0?",
+            "-vf", "scale='min(1280,iw)':-2",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-b:v", f"{alvo_kbps}k",
+            "-maxrate", f"{int(alvo_kbps * 1.3)}k",
+            "-bufsize", f"{alvo_kbps * 2}k",
+            "-pix_fmt", "yuv420p",
+            "-r", "15",
+            "-c:a", "aac", "-b:a", f"{audio_kbps}k",
+            "-movflags", "+faststart",
+            "-y", saida,
+        ]
+        t = timed(f"Compressão (tentativa {tentativa}, vídeo {alvo_kbps} kbps)", job_id, db=True)
+        run_ffmpeg(cmd, f"Comprimir MP4 -> {saida}", job_id)
+        novo = os.path.getsize(saida)
+        t(f"{novo / 1e6:.0f} MB")
+
+        if atual != mp4_path:
+            safe_rm(atual)
+        atual = saida
+        if novo <= MAX_UPLOAD_BYTES:
+            return atual
+        fator *= 0.75  # ainda grande: aperta mais
+
+    raise Exception(
+        f"Vídeo continua acima do limite de upload após compressão "
+        f"({os.path.getsize(atual) / 1e6:.0f} MB > {MAX_UPLOAD_BYTES / 1e6:.0f} MB)."
+    )
+
+
 # ---- CASO 2: extrair áudio do mp4 existente (mantido) ----
 def ffmpeg_extract_audio_m4a(input_video: str, output_audio: str, job_id: str = None):
     cmd = [
@@ -440,11 +511,16 @@ def processar_fila():
             tmp4(f"{os.path.getsize(output_video)} bytes")
             local_files.append(output_video)
 
+            # reuniões longas passam do limite do Storage (413) -> comprime
+            video_upload = garantir_tamanho_upload(output_video, job_id)
+            if video_upload != output_video:
+                local_files.append(video_upload)
+
             # uploads
             path_video = f"{caminho_base}/video_completo_render.mp4"
             path_audio = f"{caminho_base}/audio_completo.m4a"
 
-            tus_upload(output_video, path_video, "video/mp4", job_id)
+            tus_upload(video_upload, path_video, "video/mp4", job_id)
             tus_upload(output_audio, path_audio, "audio/mp4", job_id)
 
             # atualiza banco
@@ -455,7 +531,7 @@ def processar_fila():
                 "gravacao_status": "CONCLUIDO",
                 "gravacao_erro": None,
                 "gravacao_mime": "video/mp4",
-                "gravacao_size_bytes": os.path.getsize(output_video),
+                "gravacao_size_bytes": os.path.getsize(video_upload),
 
                 "gravacao_audio_bucket": BUCKET,
                 "gravacao_audio_path": path_audio,
