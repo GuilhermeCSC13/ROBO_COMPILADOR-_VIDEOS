@@ -111,6 +111,18 @@ def remove_storage(paths: list):
         supabase.storage.from_(BUCKET).remove(paths)
 
 
+def marcar_reuniao(reuniao_id: str, status: str, erro: str = None, job_id: str = None):
+    """Atualiza reunioes.gravacao_status. Sem isso o front mostra PROCESSANDO pra sempre."""
+    try:
+        supabase.table("reunioes").update({
+            "gravacao_status": status,
+            "gravacao_erro": (erro or "")[:1000] or None,
+        }).eq("id", reuniao_id).execute()
+        log(f"Reunião marcada como {status}.", job_id, icon="✅", db=True)
+    except Exception as e:
+        log(f"Falha ao marcar reunião como {status}: {e}", job_id, icon="⚠️", db=True)
+
+
 def find_sessao_folder(reuniao_id: str):
     raiz = list_storage(f"reunioes/{reuniao_id}")
     return next((i["name"] for i in raiz if i.get("name", "").startswith("sess_")), None)
@@ -441,6 +453,7 @@ def processar_fila():
                 "gravacao_bucket": BUCKET,
                 "gravacao_path": path_video,
                 "gravacao_status": "CONCLUIDO",
+                "gravacao_erro": None,
                 "gravacao_mime": "video/mp4",
                 "gravacao_size_bytes": os.path.getsize(output_video),
 
@@ -475,6 +488,7 @@ def processar_fila():
                 "status": "CONCLUIDO",
                 "log_text": "Sem ação: vídeo e áudio já existentes."
             }).eq("id", job_id).execute()
+            marcar_reuniao(reuniao_id, "CONCLUIDO", job_id=job_id)
             return
 
         if video_exists and (not audio_exists):
@@ -511,6 +525,7 @@ def processar_fila():
                 "status": "CONCLUIDO",
                 "log_text": "Sucesso: Áudio extraído do MP4 existente."
             }).eq("id", job_id).execute()
+            marcar_reuniao(reuniao_id, "CONCLUIDO", job_id=job_id)
 
             log("Concluído (mp4->audio).", job_id, icon="🎉", db=True)
             return
@@ -529,6 +544,7 @@ def processar_fila():
             "status": "ERRO",
             "log_text": str(e)
         }).eq("id", job_id).execute()
+        marcar_reuniao(reuniao_id, "ERRO", erro=str(e), job_id=job_id)
         raise
     finally:
         log("Limpando arquivos locais temporários...", job_id, icon="🧹", db=False)
