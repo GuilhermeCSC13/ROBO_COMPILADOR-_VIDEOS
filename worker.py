@@ -69,26 +69,54 @@ def timed(label: str, job_id: str = None, db: bool = False):
 # =============================================================================
 # UPLOAD (TUS / RESUMABLE)
 # =============================================================================
+UPLOAD_TENTATIVAS = int(os.getenv("UPLOAD_TENTATIVAS", "3"))
+
+
+def _status_http(e):
+    return getattr(e, "status_code", None)
+
+
 def tus_upload(local_path: str, object_name: str, content_type: str, job_id: str = None):
-    log(f"TUS upload -> {object_name} ({content_type})", job_id, icon="⬆️", db=True)
+    """Envia por TUS. Erro passageiro do Storage (5xx, 408, 429, queda de rede) tenta de novo;
+    413 (arquivo grande demais) não adianta repetir e vira mensagem clara."""
+    tamanho_mb = os.path.getsize(local_path) / 1e6
+    log(f"TUS upload -> {object_name} ({content_type}, {tamanho_mb:.0f} MB)", job_id, icon="⬆️", db=True)
 
     tus_url = f"{SUPABASE_URL}/storage/v1/upload/resumable"
     headers = {"Authorization": f"Bearer {SUPABASE_KEY}", "x-upsert": "true"}
-    my_client = tus_client.TusClient(url=tus_url, headers=headers)
 
-    uploader = my_client.uploader(
-        file_path=local_path,
-        chunk_size=6 * 1024 * 1024,
-        metadata={
-            "bucketName": BUCKET,
-            "objectName": object_name,
-            "contentType": content_type,
-            "cacheControl": "3600",
-        },
-    )
-    uploader.upload()
-
-    log(f"Upload concluído -> {object_name}", job_id, icon="✅", db=True)
+    for tentativa in range(1, UPLOAD_TENTATIVAS + 1):
+        try:
+            my_client = tus_client.TusClient(url=tus_url, headers=headers)
+            uploader = my_client.uploader(
+                file_path=local_path,
+                chunk_size=6 * 1024 * 1024,
+                metadata={
+                    "bucketName": BUCKET,
+                    "objectName": object_name,
+                    "contentType": content_type,
+                    "cacheControl": "3600",
+                },
+            )
+            uploader.upload()
+            log(f"Upload concluído -> {object_name}", job_id, icon="✅", db=True)
+            return
+        except Exception as e:
+            status = _status_http(e)
+            if status == 413:
+                raise Exception(
+                    f"Arquivo grande demais para o armazenamento ({tamanho_mb:.0f} MB): {object_name}"
+                ) from e
+            passageiro = status is None or status >= 500 or status in (408, 429)
+            if not passageiro or tentativa == UPLOAD_TENTATIVAS:
+                raise
+            espera = 20 * tentativa
+            log(
+                f"Envio falhou (tentativa {tentativa}/{UPLOAD_TENTATIVAS}, status {status}): {e}. "
+                f"Nova tentativa em {espera}s...",
+                job_id, icon="🔁", db=True,
+            )
+            time.sleep(espera)
 
 
 # =============================================================================
@@ -371,13 +399,19 @@ def processar_fila():
     log(f"Job encontrado: {job_id} | reunião: {reuniao_id}", job_id, icon="✅", db=True)
 
     log("Travando job (PROCESSANDO -> PROCESSANDO_GITH)...", job_id, icon="➡️", db=True)
-    supabase.table("reuniao_processing_queue").update({
+    # Só trava se ainda estiver PROCESSANDO: dois robôs disparados juntos (aconteceu em 05/10)
+    # não podem pegar o mesmo job — o segundo marcaria a reunião como ERRO no meio do primeiro.
+    trava = supabase.table("reuniao_processing_queue").update({
         "status": "PROCESSANDO_GITH",
         "log_text": "GitHub Actions: Iniciando processamento..."
-    }).eq("id", job_id).execute()
+    }).eq("id", job_id).eq("status", "PROCESSANDO").execute()
+    if not trava.data:
+        log("Outro robô já pegou este job. Nada a fazer.", job_id, icon="ℹ️")
+        return
     log("Job travado.", job_id, icon="✅", db=True)
 
     local_files = []
+    audio_salvo = False
     output_video = f"output_{reuniao_id}.mp4"
     output_audio = f"audio_{reuniao_id}.m4a"
 
@@ -484,6 +518,21 @@ def processar_fila():
             tm4a(f"{os.path.getsize(output_audio)} bytes")
             local_files.append(output_audio)
 
+            path_video = f"{caminho_base}/video_completo_render.mp4"
+            path_audio = f"{caminho_base}/audio_completo.m4a"
+
+            # Áudio PRIMEIRO: é pequeno e é dele que a IA tira a ata. Se o vídeo falhar
+            # depois (tamanho, Storage fora), a ata ainda pode ser gerada.
+            tus_upload(output_audio, path_audio, "audio/mp4", job_id)
+            supabase.table("reunioes").update({
+                "gravacao_audio_bucket": BUCKET,
+                "gravacao_audio_path": path_audio,
+                "gravacao_audio_mime": "audio/mp4",
+                "gravacao_audio_size_bytes": os.path.getsize(output_audio),
+            }).eq("id", reuniao_id).execute()
+            audio_salvo = True
+            log("Áudio salvo na reunião (a ata já pode ser gerada).", job_id, icon="✅", db=True)
+
             # 3) VÍDEO: remux vídeo por part -> MKV + concat MKV copy
             log("Vídeo: remux WEBM->MKV por part (copy) e concat MKV...", job_id, icon="➡️", db=True)
             with open(list_mkv_parts_path, "w") as f_list:
@@ -516,12 +565,8 @@ def processar_fila():
             if video_upload != output_video:
                 local_files.append(video_upload)
 
-            # uploads
-            path_video = f"{caminho_base}/video_completo_render.mp4"
-            path_audio = f"{caminho_base}/audio_completo.m4a"
-
+            # vídeo (o áudio já subiu)
             tus_upload(video_upload, path_video, "video/mp4", job_id)
-            tus_upload(output_audio, path_audio, "audio/mp4", job_id)
 
             # atualiza banco
             log("Atualizando tabela reunioes com paths finais...", job_id, icon="➡️", db=True)
@@ -620,7 +665,10 @@ def processar_fila():
             "status": "ERRO",
             "log_text": str(e)
         }).eq("id", job_id).execute()
-        marcar_reuniao(reuniao_id, "ERRO", erro=str(e), job_id=job_id)
+        motivo = str(e)
+        if audio_salvo:
+            motivo = f"Áudio salvo (dá para gerar a ata); o vídeo não foi salvo: {motivo}"
+        marcar_reuniao(reuniao_id, "ERRO", erro=motivo, job_id=job_id)
         raise
     finally:
         log("Limpando arquivos locais temporários...", job_id, icon="🧹", db=False)
