@@ -196,10 +196,13 @@ def confere(cond, msg):
 def main():
     if not shutil.which("ffmpeg"):
         sys.exit("precisa de ffmpeg no PATH")
-    trabalho = tempfile.mkdtemp(prefix="teste_worker_")
-    partes = gerar_partes(trabalho)
+    raiz_tmp = tempfile.mkdtemp(prefix="teste_worker_")
+    fonte = os.path.join(raiz_tmp, "fonte")        # partes geradas (o worker não pode apagá-las)
+    execucao = os.path.join(raiz_tmp, "execucao")  # pasta onde o worker baixa e limpa
+    os.makedirs(fonte); os.makedirs(execucao)
+    partes = gerar_partes(fonte)
     print(f"partes geradas: {sum(os.path.getsize(p) for p in partes) / 1e6:.1f} MB em {len(partes)} arquivos")
-    os.chdir(trabalho)
+    os.chdir(execucao)
 
     # ---- A
     print("\nA) longa + Storage com 1 erro passageiro no vídeo")
